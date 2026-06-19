@@ -1,0 +1,32 @@
+name: ci-gate
+
+# Single "ci-gate" check, one workflow so the gate can read every suite's result
+# via `needs`. Runs on pull requests only -- one run per PR commit, no duplicates.
+on:
+  pull_request:
+
+jobs:
+  pre-commit:
+    uses: ./.github/workflows/pre-commit.yaml
+
+  dag-tests:
+    uses: ./.github/workflows/dag-tests.yaml
+
+  ci-gate:
+    needs: [pre-commit, dag-tests]
+    # always() so the gate still runs (and can fail) when a suite fails; a
+    # skipped required check would otherwise be reported to GitHub as passing.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every suite to pass
+        env:
+          PRE_COMMIT: ${{ needs.pre-commit.result }}
+          DAG_TESTS: ${{ needs.dag-tests.result }}
+        run: |
+          echo "pre-commit=$PRE_COMMIT dag-tests=$DAG_TESTS"
+          if [ "$PRE_COMMIT" != "success" ] || [ "$DAG_TESTS" != "success" ]; then
+            echo "::error::A required suite did not pass; failing the gate."
+            exit 1
+          fi
+          echo "All suites passed."

@@ -1,0 +1,15 @@
+# Ruff config for the repo. Kept at the root so every package shares one ruleset.
+target-version = "py312"
+line-length = 100
+
+[lint]
+# A deliberately small, high-signal set: pyflakes/pycodestyle for correctness,
+# import sorting, pyupgrade for modern syntax, bugbear + comprehension/simplify
+# for the usual foot-guns. Add rules as the codebase grows, not preemptively.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+
+[format]
+# Match the existing style in the DAGs: double quotes, spaces, trailing commas
+# where they reduce diff noise.
+quote-style = "double"
+skip-magic-trailing-comma = false

@@ -1,0 +1,58 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Airflow: test DAG (cms_outpatient_bronze_load)",
+      "type": "shell",
+      "command": "airflow dags test cms_outpatient_bronze_load",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "AIRFLOW__CORE__DAGS_FOLDER": "${workspaceFolder}/healthcare/airflow/dags",
+          "AIRFLOW__CORE__LOAD_EXAMPLES": "False"
+        }
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ruff: lint",
+      "type": "shell",
+      "command": "ruff check .",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ruff: format",
+      "type": "shell",
+      "command": "ruff format .",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "pre-commit: install",
+      "type": "shell",
+      "command": "pre-commit install --install-hooks",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "pre-commit: run all files",
+      "type": "shell",
+      "command": "pre-commit run --all-files",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug DAG: current file (dag.test)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Debug DAG: cms_outpatient_bronze_load",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/healthcare/airflow/dags/cms_outpatient_bronze_load.py",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
