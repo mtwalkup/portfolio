@@ -1,9 +1,9 @@
 """
 Bronze landing for the CMS synthetic outpatient claims file.
 
-Pulls the published ZIP, unpacks the single CSV inside, and leaves it on the
-worker's local disk for the next stage. Nothing is reshaped here: bronze takes
-the file exactly as CMS ships it and lets the silver layer argue with it later.
+Pulls the published ZIP, unpacks the single CSV inside, and loads it into Neon
+(Postgres) as a raw, all-text table. Nothing is reshaped here: bronze takes the
+file exactly as CMS ships it.
 
 Run by hand. The source is a static, point-in-time release, so there's nothing
 to schedule against. Re-run it when CMS republishes, or when you point it at a
@@ -12,6 +12,7 @@ batch you generated yourself with Synthea.
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import shutil
@@ -22,7 +23,13 @@ from datetime import timedelta
 from typing import Any, Final
 
 import pendulum
-from airflow.sdk import dag, task  # pyright: ignore[reportUnknownVariableType]
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.sdk import (
+    Param,
+    dag,  # pyright: ignore[reportUnknownVariableType]
+    get_current_context,
+    task,
+)
 
 # Static URL for now.
 SOURCE_URL: Final[str] = (
@@ -43,6 +50,19 @@ USER_AGENT: Final[str] = "mtwalkup-bronze-loader/1.0"
 
 # Bound the fetch so a half-open socket can't pin a worker slot indefinitely.
 DOWNLOAD_TIMEOUT_SECONDS: Final[int] = 300
+
+# Database/environment targets
+ENVIRONMENTS: Final[list[str]] = ["development", "production"]
+DEFAULT_ENV: Final[str] = os.environ.get("PIPELINE_ENV", "development")
+
+# CMS ships these BENE files pipe-delimited, not comma. Used for both reading the
+# header and the COPY, so a future comma/tab release is a one-line change here.
+DELIMITER: Final[str] = "|"
+
+# The table is dropped and rebuilt from the CSV header on every run, so the
+# schema follows the file and re-running never duplicates rows.
+TARGET_SCHEMA: Final[str] = "bronze"
+FQ_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_outpatient"
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +93,19 @@ def _safe_remove(path: str) -> None:
         log.warning("could not remove %s: %s", path, exc)
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a string for use as a Postgres identifier.
+
+    Lets us build column names straight from the CSV header without worrying
+    about case, spaces, or reserved words. Embedded double quotes are doubled,
+    per Postgres' quoting rules.
+
+    Args:
+        name: Raw column name from the CSV header.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 @dag(
     dag_id="cms_outpatient_bronze_load",
     description="Land the CMS synthetic outpatient claims file (bronze).",
@@ -83,6 +116,15 @@ def _safe_remove(path: str) -> None:
     default_args=default_args,
     doc_md=__doc__,
     tags=["cms", "bronze", "outpatient"],
+    params={
+        "env": Param(
+            DEFAULT_ENV,
+            type="string",
+            enum=ENVIRONMENTS,
+            title="Target environment",
+            description="Which Neon connection to load into (healthcare_<env>).",
+        ),
+    },
 )
 def cms_outpatient_bronze_load() -> None:
     """Define the bronze-landing DAG for the CMS synthetic outpatient file."""
@@ -152,7 +194,64 @@ def cms_outpatient_bronze_load() -> None:
         log.info("staged %s (%s bytes)", csv_path, f"{os.path.getsize(csv_path):,}")
         return csv_path  # next task picks this up off XCom
 
-    download_and_unzip()
+    @task(execution_timeout=timedelta(minutes=30))
+    def load_to_neon(csv_path: str) -> int:
+        """Replace the Neon bronze table with the CSV's contents.
+
+        Columns are taken from the CSV header in file order, all typed as text --
+        bronze keeps the data raw. Each run drops and rebuilds the table, then
+        COPYs the file in, so it's idempotent: the table always ends up equal to
+        the file, never with duplicate rows. (The rebuild and the COPY are
+        separate transactions; a mid-load failure leaves an empty table that the
+        next run refills -- still no duplicates, since a run replaces, never
+        appends.)
+
+        The target environment comes from the run's `env` param (set on the
+        trigger form), so the connection id is resolved here at runtime rather
+        than baked in at parse time.
+
+        Args:
+            csv_path: Absolute path to the extracted CSV, read off XCom. Assumed
+                reachable from this worker (see WORK_DIR note on task locality).
+
+        Returns:
+            Number of rows loaded.
+
+        Raises:
+            ValueError: The header has duplicate column names, which would make
+                the COPY target ambiguous.
+        """
+        env = get_current_context()["params"]["env"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        conn_id = f"healthcare_{env}"
+
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            header = [col.strip() for col in next(csv.reader(fh, delimiter=DELIMITER))]
+        if len(set(header)) != len(header):
+            raise ValueError(f"duplicate column names in header: {header}")
+
+        columns = [_quote_ident(col) for col in header]
+        cols_ddl = ",\n    ".join(f"{col} text" for col in columns)
+        col_list = ", ".join(columns)
+
+        hook = PostgresHook(postgres_conn_id=conn_id)
+        hook.run(  # pyright: ignore[reportUnknownMemberType]
+            [
+                f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};",
+                f"DROP TABLE IF EXISTS {FQ_TABLE};",
+                f"CREATE TABLE {FQ_TABLE} (\n    {cols_ddl}\n);",
+            ]
+        )
+        hook.copy_expert(
+            f"COPY {FQ_TABLE} ({col_list}) FROM STDIN "
+            f"WITH (FORMAT csv, HEADER true, DELIMITER '{DELIMITER}')",
+            csv_path,
+        )
+
+        rows = int(hook.get_first(f"SELECT count(*) FROM {FQ_TABLE};")[0])  # pyright: ignore[reportUnknownMemberType]
+        log.info("loaded %s rows into %s via %s", f"{rows:,}", FQ_TABLE, conn_id)
+        return rows
+
+    load_to_neon(download_and_unzip())  # pyright: ignore[reportArgumentType]
 
 
 bronze_load_dag = cms_outpatient_bronze_load()
