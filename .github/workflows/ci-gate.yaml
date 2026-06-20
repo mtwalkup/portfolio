@@ -12,8 +12,12 @@ jobs:
   dag-tests:
     uses: ./.github/workflows/dag-tests.yaml
 
+  data-dictionary:
+    uses: ./.github/workflows/data-dictionary.yaml
+    secrets: inherit
+
   ci-gate:
-    needs: [pre-commit, dag-tests]
+    needs: [pre-commit, dag-tests, data-dictionary]
     # always() so the gate still runs (and can fail) when a suite fails; a
     # skipped required check would otherwise be reported to GitHub as passing.
     if: ${{ always() }}
@@ -23,9 +27,11 @@ jobs:
         env:
           PRE_COMMIT: ${{ needs.pre-commit.result }}
           DAG_TESTS: ${{ needs.dag-tests.result }}
+          DATA_DICTIONARY: ${{ needs.data-dictionary.result }}
         run: |
-          echo "pre-commit=$PRE_COMMIT dag-tests=$DAG_TESTS"
-          if [ "$PRE_COMMIT" != "success" ] || [ "$DAG_TESTS" != "success" ]; then
+          echo "pre-commit=$PRE_COMMIT dag-tests=$DAG_TESTS data-dictionary=$DATA_DICTIONARY"
+          if [ "$PRE_COMMIT" != "success" ] || [ "$DAG_TESTS" != "success" ] \
+             || [ "$DATA_DICTIONARY" != "success" ]; then
             echo "::error::A required suite did not pass; failing the gate."
             exit 1
           fi

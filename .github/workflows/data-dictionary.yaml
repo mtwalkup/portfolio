@@ -1,0 +1,34 @@
+name: data-dictionary
+
+# Reusable: invoked by the ci-gate workflow, not triggered directly. Regenerates
+# the committed data dictionary from the live database and fails if it has
+# drifted, so docs/cms_outpatient_data_dictionary.md always reflects the deployed
+# bronze table.
+on:
+  workflow_call:
+    secrets:
+      NEON_DSN:
+        required: true
+        description: libpq URI for the database the dictionary is generated from.
+
+jobs:
+  data-dictionary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+      - name: Regenerate the data dictionary from the database
+        env:
+          PG_DSN: ${{ secrets.NEON_DSN }}
+        run: python healthcare/airflow/scripts/build_data_dictionary.py
+      - name: Fail if the committed dictionary is stale
+        run: |
+          if ! git diff --exit-code -- healthcare/airflow/docs/cms_outpatient_data_dictionary.md; then
+            echo "::error::docs/cms_outpatient_data_dictionary.md is out of date; \
+            regenerate it with healthcare/airflow/scripts/build_data_dictionary.py and commit."
+            exit 1
+          fi

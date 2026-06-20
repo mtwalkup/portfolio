@@ -2,8 +2,11 @@
 Bronze landing for the CMS synthetic outpatient claims file.
 
 Pulls the published ZIP, unpacks the single CSV inside, and loads it into Neon
-(Postgres) as a raw, all-text table. Nothing is reshaped here: bronze takes the
-file exactly as CMS ships it.
+(Postgres). Rows land exactly as CMS ships them -- no rows are added, dropped, or
+reordered -- but each column is cast to a Postgres type and carries a column
+COMMENT. Both the types and the descriptions are fetched at load time from the
+authoritative CCW/NCH variable metadata (CMS BlueButton codesets); nothing about
+the schema is hard-coded in this repo.
 
 Run by hand. The source is a static, point-in-time release, so there's nothing
 to schedule against. Re-run it when CMS republishes, or when you point it at a
@@ -13,6 +16,7 @@ batch you generated yourself with Synthea.
 from __future__ import annotations
 
 import csv
+import io
 import logging
 import os
 import shutil
@@ -25,6 +29,7 @@ from typing import Any, Final
 import pendulum
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk import (
+    Asset,
     Param,
     dag,  # pyright: ignore[reportUnknownVariableType]
     get_current_context,
@@ -36,6 +41,25 @@ SOURCE_URL: Final[str] = (
     "https://data.cms.gov/sites/default/files/2023-04/"
     "c3d8a962-c6b8-4a59-adb5-f0495cc81fda/Outpatient.zip"
 )
+
+# Column types and descriptions come from the authoritative CCW/NCH variable
+# metadata -- nothing about the schema is hand-maintained here. The CMS BlueButton
+# codesets publish one CSV keyed by variable name with its storage class and
+# description: https://github.com/CMSgov/bluebutton-csv-codesets
+DICTIONARY_URL: Final[str] = (
+    "https://raw.githubusercontent.com/CMSgov/bluebutton-csv-codesets/master/csv/all_meta.csv"
+)
+
+# That metadata is landed as its own bronze table in the same run and read back
+# to type + comment the claims table -- so the dictionary the load applies is
+# always the one just landed (no drift), and it's a reusable, SQL-queryable asset
+# for the other claim files and for dbt.
+DICTIONARY_TABLE: Final[str] = "bronze.ccw_variable_metadata"
+CCW_DICTIONARY_ASSET: Final[Asset] = Asset(f"neon://{DICTIONARY_TABLE}")
+
+# Map the CCW storage class straight onto a Postgres type: dates -> date,
+# numerics -> numeric, everything else (codes, ids, flags) stays text.
+CCW_TYPE_TO_PG: Final[dict[str, str]] = {"DATE": "date", "NUM": "numeric", "CHAR": "text"}
 
 # /tmp is local to whichever worker runs the task. Download and unzip are kept
 # in one task so they share it. If you ever split the load into its own task it
@@ -59,10 +83,17 @@ DEFAULT_ENV: Final[str] = os.environ.get("PIPELINE_ENV", "development")
 # header and the COPY, so a future comma/tab release is a one-line change here.
 DELIMITER: Final[str] = "|"
 
-# The table is dropped and rebuilt from the CSV header on every run, so the
-# schema follows the file and re-running never duplicates rows.
+# Both tables are dropped and rebuilt on every run, so re-running never
+# duplicates rows. The file is COPYed into an all-text staging table first, then
+# cast into the typed table -- so a malformed value surfaces in the cast, not as
+# an aborted bulk load.
 TARGET_SCHEMA: Final[str] = "bronze"
 FQ_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_outpatient"
+STAGING_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_outpatient_staging"
+
+# Source dates are 'DD-Mon-YYYY' (e.g. 01-Jun-2015). Parsed with an explicit
+# format so the load doesn't depend on the Neon server's DateStyle setting.
+DATE_INPUT_FORMAT: Final[str] = "DD-Mon-YYYY"
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +135,44 @@ def _quote_ident(name: str) -> str:
         name: Raw column name from the CSV header.
     """
     return '"' + name.replace('"', '""') + '"'
+
+
+def _quote_literal(value: str) -> str:
+    """Quote a string as a Postgres string literal for COMMENT statements.
+
+    Embedded single quotes are doubled, per Postgres' literal-quoting rules. Used
+    only for trusted dictionary text, never user input.
+
+    Args:
+        value: The literal text to embed in SQL.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _dictionary_from_records(
+    records: list[tuple[str | None, str | None, str | None, str | None]],
+) -> dict[str, tuple[str, str]]:
+    """Build the column -> (postgres_type, description) map from metadata rows.
+
+    Each record is ``(long_name, name, ccw_type, description)`` read from the
+    landed CCW dictionary table. Indexed by both names (upper-cased) so a column
+    resolves whichever it's filed under; the CCW storage class maps to a Postgres
+    type via CCW_TYPE_TO_PG.
+
+    Args:
+        records: Rows of ``(long_name, name, type, description)``.
+
+    Returns:
+        Mapping of upper-cased variable name -> (postgres_type, description).
+    """
+    dictionary: dict[str, tuple[str, str]] = {}
+    for long_name, name, ccw_type, description in records:
+        pg_type = CCW_TYPE_TO_PG.get((ccw_type or "").strip(), "text")
+        desc = (description or "").strip()
+        for key in (long_name, name):
+            if key:
+                dictionary.setdefault(key.strip().upper(), (pg_type, desc))
+    return dictionary
 
 
 @dag(
@@ -194,17 +263,79 @@ def cms_outpatient_bronze_load() -> None:
         log.info("staged %s (%s bytes)", csv_path, f"{os.path.getsize(csv_path):,}")
         return csv_path  # next task picks this up off XCom
 
+    @task(execution_timeout=timedelta(minutes=10), outlets=[CCW_DICTIONARY_ASSET])
+    def land_ccw_dictionary() -> str:
+        """Land the CCW variable metadata as its own bronze table.
+
+        Downloads the CMS BlueButton ``all_meta.csv`` and replaces the dictionary
+        table with it, every column text -- a plain bronze landing of a source
+        file. The claims load reads types and column descriptions back out of this
+        table in the same run, so the dictionary it applies is always the one just
+        landed (no drift). The table is a reusable, SQL-queryable asset for the
+        other claim files and for dbt.
+
+        Returns:
+            The fully-qualified dictionary table name.
+
+        Raises:
+            ConnectionError: The metadata CSV could not be fetched.
+        """
+        env = get_current_context()["params"]["env"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+        conn_id = f"portfolio_healthcare_{env}"
+
+        # Held in memory and inserted via csv.DictReader rather than COPYed from a
+        # file: the source has blank trailing lines COPY would reject, and writing
+        # a CSV next to the claims file would break that task's "exactly one CSV"
+        # check. all_meta.csv is small (a few hundred rows), so this is cheap.
+        log.info("fetching %s", DICTIONARY_URL)
+        request = urllib.request.Request(DICTIONARY_URL, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as resp:
+                text = resp.read().decode("utf-8")
+        except urllib.error.URLError as exc:
+            raise ConnectionError(f"can't reach {DICTIONARY_URL}: {exc.reason}") from exc
+
+        reader = csv.DictReader(io.StringIO(text))
+        header = reader.fieldnames
+        if not header:
+            raise ValueError(f"no header in CCW metadata from {DICTIONARY_URL}")
+        rows = [
+            [row.get(col) for col in header]
+            for row in reader
+            if any((value or "").strip() for value in row.values())
+        ]
+
+        cols_ddl = ",\n    ".join(f"{_quote_ident(col)} text" for col in header)
+        hook = PostgresHook(postgres_conn_id=conn_id)
+        hook.run(  # pyright: ignore[reportUnknownMemberType]
+            [
+                f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};",
+                f"DROP TABLE IF EXISTS {DICTIONARY_TABLE};",
+                f"CREATE TABLE {DICTIONARY_TABLE} (\n    {cols_ddl}\n);",
+            ]
+        )
+        hook.insert_rows(  # pyright: ignore[reportUnknownMemberType]
+            DICTIONARY_TABLE, rows, target_fields=header, commit_every=1000
+        )
+        log.info("landed %s CCW variables into %s", f"{len(rows):,}", DICTIONARY_TABLE)
+        return DICTIONARY_TABLE
+
     @task(execution_timeout=timedelta(minutes=30))
     def load_to_neon(csv_path: str) -> int:
-        """Replace the Neon bronze table with the CSV's contents.
+        """Replace the Neon bronze table with the CSV's contents, typed.
 
-        Columns are taken from the CSV header in file order, all typed as text --
-        bronze keeps the data raw. Each run drops and rebuilds the table, then
-        COPYs the file in, so it's idempotent: the table always ends up equal to
-        the file, never with duplicate rows. (The rebuild and the COPY are
-        separate transactions; a mid-load failure leaves an empty table that the
-        next run refills -- still no duplicates, since a run replaces, never
-        appends.)
+        The file is COPYed verbatim into an all-text staging table, then cast
+        column-by-column into the typed table, using types read from the CCW
+        dictionary table landed upstream in this same run (blanks normalised to
+        NULL). Rows are preserved one-for-one -- only the column types change --
+        and each column is annotated with its CCW description as a Postgres
+        COMMENT. No types or descriptions are hard-coded in this repo.
+
+        Each run drops and rebuilds both tables, so it's idempotent: the table
+        always ends up equal to the file, never with duplicate rows. (The steps
+        are separate transactions; a mid-load failure leaves an empty or missing
+        table that the next run refills -- still no duplicates, since a run
+        replaces, never appends.)
 
         The target environment comes from the run's `env` param (set on the
         trigger form), so the connection id is resolved here at runtime rather
@@ -218,40 +349,90 @@ def cms_outpatient_bronze_load() -> None:
             Number of rows loaded.
 
         Raises:
-            ValueError: The header has duplicate column names, which would make
-                the COPY target ambiguous.
+            ValueError: The header has duplicate column names (which would make
+                the COPY target ambiguous), or a shipped column is absent from
+                the CCW metadata (which would leave it un-typed/un-described).
         """
         env = get_current_context()["params"]["env"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
-        conn_id = f"healthcare_{env}"
+        conn_id = f"portfolio_healthcare_{env}"
+        hook = PostgresHook(postgres_conn_id=conn_id)
 
         with open(csv_path, newline="", encoding="utf-8") as fh:
             header = [col.strip() for col in next(csv.reader(fh, delimiter=DELIMITER))]
         if len(set(header)) != len(header):
             raise ValueError(f"duplicate column names in header: {header}")
 
-        columns = [_quote_ident(col) for col in header]
-        cols_ddl = ",\n    ".join(f"{col} text" for col in columns)
-        col_list = ", ".join(columns)
+        # Types + descriptions come from the CCW dictionary table landed upstream
+        # in this same run (see land_ccw_dictionary) -- nothing about the schema is
+        # hard-coded, and the dictionary applied is always the one just landed, so
+        # the two can't drift. Every shipped column must resolve, so a silent
+        # layout change fails loudly rather than landing un-typed or un-commented.
+        records = hook.get_records(  # pyright: ignore[reportUnknownMemberType]
+            f"SELECT long_name, name, type, description FROM {DICTIONARY_TABLE};"
+        )
+        dictionary = _dictionary_from_records(records)
+        unknown = [col for col in header if col.upper() not in dictionary]
+        if unknown:
+            raise ValueError(f"columns missing from CCW metadata: {unknown}")
+        specs = {col: dictionary[col.upper()] for col in header}  # col -> (pg_type, description)
 
-        hook = PostgresHook(postgres_conn_id=conn_id)
+        idents = {col: _quote_ident(col) for col in header}
+        col_list = ", ".join(idents[col] for col in header)
+
+        staging_ddl = ",\n    ".join(f"{idents[col]} text" for col in header)
+        typed_ddl = ",\n    ".join(f"{idents[col]} {specs[col][0]}" for col in header)
+
+        def _cast(col: str) -> str:
+            """Build the staging->typed SELECT expression for one column."""
+            ident = idents[col]
+            pg_type = specs[col][0]
+            if pg_type == "date":
+                return f"to_date(NULLIF({ident}, ''), '{DATE_INPUT_FORMAT}') AS {ident}"
+            if pg_type == "text":
+                return f"NULLIF({ident}, '') AS {ident}"
+            return f"NULLIF({ident}, '')::{pg_type} AS {ident}"
+
+        select_list = ",\n    ".join(_cast(col) for col in header)
+        insert_typed = (
+            f"INSERT INTO {FQ_TABLE} ({col_list})\nSELECT\n    {select_list}\nFROM {STAGING_TABLE};"
+        )
+
+        comments = [
+            f"COMMENT ON COLUMN {FQ_TABLE}.{idents[col]} IS {_quote_literal(specs[col][1])};"
+            for col in header
+        ]
+
         hook.run(  # pyright: ignore[reportUnknownMemberType]
             [
                 f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA};",
-                f"DROP TABLE IF EXISTS {FQ_TABLE};",
-                f"CREATE TABLE {FQ_TABLE} (\n    {cols_ddl}\n);",
+                f"DROP TABLE IF EXISTS {STAGING_TABLE};",
+                f"CREATE TABLE {STAGING_TABLE} (\n    {staging_ddl}\n);",
             ]
         )
         hook.copy_expert(
-            f"COPY {FQ_TABLE} ({col_list}) FROM STDIN "
+            f"COPY {STAGING_TABLE} ({col_list}) FROM STDIN "
             f"WITH (FORMAT csv, HEADER true, DELIMITER '{DELIMITER}')",
             csv_path,
+        )
+        hook.run(  # pyright: ignore[reportUnknownMemberType]
+            [
+                f"DROP TABLE IF EXISTS {FQ_TABLE};",
+                f"CREATE TABLE {FQ_TABLE} (\n    {typed_ddl}\n);",
+                insert_typed,
+                f"DROP TABLE {STAGING_TABLE};",
+                *comments,
+            ]
         )
 
         rows = int(hook.get_first(f"SELECT count(*) FROM {FQ_TABLE};")[0])  # pyright: ignore[reportUnknownMemberType]
         log.info("loaded %s rows into %s via %s", f"{rows:,}", FQ_TABLE, conn_id)
         return rows
 
-    load_to_neon(download_and_unzip())  # pyright: ignore[reportArgumentType]
+    # The load reads the dictionary table, so the landing must finish first; the
+    # download runs in parallel with it. Both feed the single load.
+    dictionary_ready = land_ccw_dictionary()
+    loaded = load_to_neon(download_and_unzip())  # pyright: ignore[reportArgumentType]
+    dictionary_ready >> loaded  # pyright: ignore[reportUnusedExpression]
 
 
 bronze_load_dag = cms_outpatient_bronze_load()
