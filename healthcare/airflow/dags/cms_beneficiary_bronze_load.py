@@ -1,19 +1,31 @@
 """
-Bronze landing for the CMS synthetic outpatient claims file.
+Bronze landing for the CMS synthetic beneficiary (patient) summary file.
 
-Pulls the published ZIP, unpacks the single CSV inside, and loads it into Neon
-(Postgres). Rows land exactly as CMS ships them -- no rows are added, dropped, or
-reordered -- but each column is cast to a Postgres type and carries a column
-COMMENT. Both the types and the descriptions are fetched at load time from the
-authoritative CCW/NCH variable metadata (CMS BlueButton codesets); nothing about
-the schema is hard-coded in this repo.
+Pulls the published ZIP, unpacks the eleven yearly CSVs inside (one per
+reference year, 2015-2025), and loads them into Neon (Postgres) as a single
+table. Rows land exactly as CMS ships them -- no rows are added, dropped, or
+reordered, and every yearly file is unioned in -- so the grain here is one row
+per beneficiary *per reference year* (a beneficiary recurs across years).
+Collapsing to one row per beneficiary is deferred to silver.
 
-The file COPYs directly into the typed table (no all-text staging copy), keeping
-peak Neon storage to one copy of the data. In development the claims are filtered
-to the beneficiary cohort already in ``bronze.cms_beneficiary`` (~1000 BENE_IDs
-picked by the beneficiary load), so the dev claim subset stays joinable to the
-patients and fits a small Neon database -- run ``cms_beneficiary_bronze_load`` in
-development first. Production loads every claim.
+Each column is cast to a Postgres type and, where the variable is documented,
+carries a column COMMENT. Types and descriptions are fetched at load time from
+the same authoritative CCW/NCH variable metadata (CMS BlueButton codesets) that
+the outpatient load uses, landed into the *same* ``bronze.ccw_variable_metadata``
+table in this run. Unlike the outpatient file, the beneficiary (MBSF) layout is
+only partially covered by that codeset: the ~95 columns it doesn't document
+(monthly status arrays, Part C contract/plan ids, a few demographics like
+``SEX_IDENT_CD`` / ``AGE_AT_END_REF_YR``) land as plain ``text`` with no comment
+rather than failing the load. The columns silver needs for ``patients`` -- birth
+date, death date, sex, race, age, state/county/zip -- are all present.
+
+Files COPY directly into the typed table (no all-text staging copy), which keeps
+peak Neon storage to one copy of the data. In development the load is also capped
+to the first N distinct beneficiaries (``dev_beneficiary_limit``, default 1000),
+the same cohort across every year, so the whole thing fits a small Neon database.
+No separate cohort table is kept: the loaded ``cms_beneficiary`` table *is* the
+cohort, and the claim loads subset themselves to the BENE_IDs in it so their dev
+rows still join. Production loads everyone.
 
 Run by hand. The source is a static, point-in-time release, so there's nothing
 to schedule against. Re-run it when CMS republishes, or when you point it at a
@@ -44,37 +56,41 @@ from airflow.sdk import (
     task,
 )
 
-# Static URL for now.
+# Static URL for now. The published name has spaces; keep them percent-encoded so
+# urllib doesn't have to guess. This single ZIP holds all eleven yearly files.
 SOURCE_URL: Final[str] = (
     "https://data.cms.gov/sites/default/files/2023-04/"
-    "c3d8a962-c6b8-4a59-adb5-f0495cc81fda/Outpatient.zip"
+    "250e6ca0-3515-4767-957c-5528bfcee75c/All%20Beneficiary%20Years.zip"
 )
 
 # Column types and descriptions come from the authoritative CCW/NCH variable
-# metadata -- nothing about the schema is hand-maintained here. The CMS BlueButton
+# metadata -- the same codeset the outpatient load uses. The CMS BlueButton
 # codesets publish one CSV keyed by variable name with its storage class and
 # description: https://github.com/CMSgov/bluebutton-csv-codesets
 DICTIONARY_URL: Final[str] = (
     "https://raw.githubusercontent.com/CMSgov/bluebutton-csv-codesets/master/csv/all_meta.csv"
 )
 
-# That metadata is landed as its own bronze table in the same run and read back
-# to type + comment the claims table -- so the dictionary the load applies is
-# always the one just landed (no drift), and it's a reusable, SQL-queryable asset
-# for the other claim files and for dbt.
+# Landed as its own bronze table and read back to type + comment the beneficiary
+# table -- so the dictionary applied is always the one just landed (no drift),
+# and it's a reusable, SQL-queryable asset shared with the other claim loads and
+# with dbt. Same table the outpatient load writes; both drop + rebuild it, and
+# each lands the identical source file, so re-landing is harmless.
 DICTIONARY_TABLE: Final[str] = "bronze.ccw_variable_metadata"
 CCW_DICTIONARY_ASSET: Final[Asset] = Asset(f"neon://{DICTIONARY_TABLE}")
 
 # Map the CCW storage class straight onto a Postgres type: dates -> date,
-# numerics -> numeric, everything else (codes, ids, flags) stays text.
+# numerics -> numeric, everything else (codes, ids, flags) stays text. Columns
+# the codeset doesn't document also fall back to text (see UNDOCUMENTED_TYPE).
 CCW_TYPE_TO_PG: Final[dict[str, str]] = {"DATE": "date", "NUM": "numeric", "CHAR": "text"}
+UNDOCUMENTED_TYPE: Final[str] = "text"
 
 # /tmp is local to whichever worker runs the task. Download and unzip are kept
 # in one task so they share it. If you ever split the load into its own task it
 # can land on a different worker that can't see these files: keep the load
 # in-task, or stage to shared storage (S3/GCS/volume) at that point.
-WORK_DIR: Final[str] = "/tmp/cms_outpatient"
-ZIP_PATH: Final[str] = os.path.join(WORK_DIR, "outpatient.zip")
+WORK_DIR: Final[str] = "/tmp/cms_beneficiary"
+ZIP_PATH: Final[str] = os.path.join(WORK_DIR, "beneficiary.zip")
 
 # Plenty of CDN and .gov front ends quietly block the default "Python-urllib"
 # user-agent. Cheap insurance to send something that looks like a real client.
@@ -92,23 +108,27 @@ DEFAULT_ENV: Final[str] = os.environ.get("PIPELINE_ENV", "development")
 DELIMITER: Final[str] = "|"
 
 # The typed table is dropped and rebuilt on every run, so re-running never
-# duplicates rows. The file COPYs *directly* into the typed table -- there's no
-# all-text staging copy, which would otherwise hold the whole file a second time
-# on Neon (the staging table is what blows past small Neon tiers). The trade-off:
-# a malformed value aborts the COPY rather than surfacing in a cast. Acceptable
-# for a trusted, consistent synthetic source. Two things make direct COPY safe
-# here: CMS dates have a textual month (e.g. 01-Jun-2015) that Postgres parses
-# natively into `date` regardless of DateStyle, and CSV-format COPY already reads
-# an empty unquoted field as NULL -- so no to_date/NULLIF staging pass is needed.
+# duplicates rows. Files COPY *directly* into the typed table -- there's no
+# all-text staging copy, which would otherwise hold the whole dataset a second
+# time on Neon (the staging table is what blows past small Neon tiers). The
+# trade-off: a malformed value aborts that file's COPY rather than surfacing in a
+# cast. Acceptable for a trusted, consistent synthetic source. Two things make
+# direct COPY safe here: CMS dates have a textual month (e.g. 16-Aug-1999) that
+# Postgres parses natively into `date` regardless of DateStyle, and CSV-format
+# COPY already reads an empty unquoted field as NULL -- so no to_date/NULLIF
+# staging pass is needed.
 TARGET_SCHEMA: Final[str] = "bronze"
-FQ_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_outpatient"
+FQ_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_beneficiary"
 
-# In development the claims are filtered to the beneficiaries already loaded into
-# this table by cms_beneficiary_bronze_load (the dev cohort, ~1000 BENE_IDs), so
-# the dev claim subset matches the dev patient cohort and the two still join. The
-# beneficiary table *is* the cohort -- no separate selection table is kept.
-BENEFICIARY_TABLE: Final[str] = f"{TARGET_SCHEMA}.cms_beneficiary"
+# The beneficiary key. Used to pick the dev cohort and to filter every yearly
+# file down to it. The MBSF synthetic layout names it BENE_ID. In development the
+# load keeps just the first N distinct of these (see dev_beneficiary_limit) so the
+# whole thing fits a small Neon database; the resulting cms_beneficiary table *is*
+# the cohort, which the claim loads read directly so their dev subset still joins.
 BENE_ID_COLUMN: Final[str] = "BENE_ID"
+
+# Cap applied only when env == development; production ignores it and loads all.
+DEV_DEFAULT_LIMIT: Final[int] = 1000
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +194,39 @@ def _read_header(csv_path: str) -> list[str]:
         return [col.strip() for col in next(csv.reader(fh, delimiter=DELIMITER))]
 
 
+def _collect_cohort(csv_paths: list[str], bene_idx: int, limit: int) -> list[str]:
+    """Return the first ``limit`` distinct beneficiary ids across the yearly files.
+
+    Files are read in the order given and ids collected in first-seen order until
+    the cap is hit, so the result is deterministic. The same ids are then used to
+    filter *every* file (see _filter_to_cohort), giving a cohort that's consistent
+    across reference years -- a beneficiary kept for 2015 is kept for 2025 too --
+    so silver can still follow a patient through time on the dev subset.
+
+    Args:
+        csv_paths: Absolute paths to the extracted yearly CSVs.
+        bene_idx: Zero-based index of the beneficiary-id column in each row.
+        limit: Maximum number of distinct ids to return.
+
+    Returns:
+        Up to ``limit`` beneficiary ids, in first-seen order.
+    """
+    seen: dict[str, None] = {}  # insertion-ordered set
+    for path in csv_paths:
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh, delimiter=DELIMITER)
+            next(reader, None)  # skip header
+            for row in reader:
+                if bene_idx >= len(row):
+                    continue
+                bene_id = row[bene_idx].strip()
+                if bene_id and bene_id not in seen:
+                    seen[bene_id] = None
+                    if len(seen) >= limit:
+                        return list(seen)
+    return list(seen)
+
+
 def _filter_to_cohort(path: str, bene_idx: int, allowed: set[str]) -> str:
     """Write a temp copy of ``path`` holding only rows whose id is in ``allowed``.
 
@@ -184,7 +237,7 @@ def _filter_to_cohort(path: str, bene_idx: int, allowed: set[str]) -> str:
     The caller deletes the temp file once COPYed.
 
     Args:
-        path: Absolute path to the source CSV.
+        path: Absolute path to a source yearly CSV.
         bene_idx: Zero-based index of the beneficiary-id column.
         allowed: Beneficiary ids to keep.
 
@@ -218,7 +271,8 @@ def _dictionary_from_records(
     Each record is ``(long_name, name, ccw_type, description)`` read from the
     landed CCW dictionary table. Indexed by both names (upper-cased) so a column
     resolves whichever it's filed under; the CCW storage class maps to a Postgres
-    type via CCW_TYPE_TO_PG.
+    type via CCW_TYPE_TO_PG. Columns absent from the metadata are not in here at
+    all -- the caller defaults those to text (see UNDOCUMENTED_TYPE).
 
     Args:
         records: Rows of ``(long_name, name, type, description)``.
@@ -228,7 +282,7 @@ def _dictionary_from_records(
     """
     dictionary: dict[str, tuple[str, str]] = {}
     for long_name, name, ccw_type, description in records:
-        pg_type = CCW_TYPE_TO_PG.get((ccw_type or "").strip(), "text")
+        pg_type = CCW_TYPE_TO_PG.get((ccw_type or "").strip(), UNDOCUMENTED_TYPE)
         desc = (description or "").strip()
         for key in (long_name, name):
             if key:
@@ -237,42 +291,53 @@ def _dictionary_from_records(
 
 
 @dag(
-    dag_id="cms_outpatient_bronze_load",
-    description="Land the CMS synthetic outpatient claims file (bronze).",
+    dag_id="cms_beneficiary_bronze_load",
+    description="Land the CMS synthetic beneficiary (patient) summary file (bronze).",
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     max_active_runs=1,  # two concurrent runs would race on the same WORK_DIR
     default_args=default_args,
     doc_md=__doc__,
-    tags=["cms", "bronze", "outpatient"],
+    tags=["cms", "bronze", "beneficiary", "patient"],
     params={
         "env": Param(
             DEFAULT_ENV,
             type="string",
             enum=ENVIRONMENTS,
             title="Target environment",
-            description="Which Neon connection to load into (healthcare_<env>).",
+            description="Which Neon connection to load into (portfolio_healthcare_<env>).",
+        ),
+        "dev_beneficiary_limit": Param(
+            DEV_DEFAULT_LIMIT,
+            type="integer",
+            minimum=1,
+            title="Dev beneficiary limit",
+            description=(
+                "Development only: load just the first N distinct BENE_IDs, kept "
+                "consistently across all years; the claim loads reuse this cohort. "
+                "Ignored in production, which loads everyone."
+            ),
         ),
     },
 )
-def cms_outpatient_bronze_load() -> None:
-    """Define the bronze-landing DAG for the CMS synthetic outpatient file."""
+def cms_beneficiary_bronze_load() -> None:
+    """Define the bronze-landing DAG for the CMS synthetic beneficiary file."""
 
     @task(execution_timeout=timedelta(minutes=15))
-    def download_and_unzip() -> str:
-        """Download the source ZIP and extract the single CSV it contains.
+    def download_and_unzip() -> list[str]:
+        """Download the source ZIP and extract the yearly CSVs it contains.
 
         Returns:
-            Absolute path to the extracted CSV, which the next task reads off
-            XCom.
+            Sorted list of absolute paths to the extracted CSVs, read off XCom by
+            the next task. The list is small (eleven short strings), so passing it
+            through XCom is fine.
 
         Raises:
             ConnectionError: The file could not be fetched (an HTTP status error,
                 or the host was unreachable, which on a server usually means
                 egress is blocked).
-            ValueError: The download came back empty, or the archive did not hold
-                exactly one CSV.
+            ValueError: The download came back empty, or the archive held no CSVs.
             zipfile.BadZipFile: The downloaded bytes were not a valid ZIP.
         """
         os.makedirs(WORK_DIR, exist_ok=True)
@@ -314,15 +379,18 @@ def cms_outpatient_bronze_load() -> None:
         except zipfile.BadZipFile as exc:
             raise zipfile.BadZipFile(f"{ZIP_PATH} isn't a valid zip file") from exc
 
-        # Rely on exactly one CSV. Assert it rather than taking [0], so a future
-        # multi-file release fails here instead of silently loading the wrong one.
-        csvs = [f for f in os.listdir(WORK_DIR) if f.lower().endswith(".csv")]
-        if len(csvs) != 1:
-            raise ValueError(f"expected one csv, found {len(csvs)}: {csvs}")
+        # Unlike the single-CSV outpatient file, this archive ships one CSV per
+        # reference year. Take all of them; the load unions them and asserts they
+        # share a header. An empty archive means the release layout changed.
+        csv_paths = sorted(
+            os.path.join(WORK_DIR, f) for f in os.listdir(WORK_DIR) if f.lower().endswith(".csv")
+        )
+        if not csv_paths:
+            raise ValueError(f"no csv files found in {ZIP_PATH}")
 
-        csv_path = os.path.join(WORK_DIR, csvs[0])
-        log.info("staged %s (%s bytes)", csv_path, f"{os.path.getsize(csv_path):,}")
-        return csv_path  # next task picks this up off XCom
+        names = [os.path.basename(p) for p in csv_paths]
+        log.info("staged %s csv files: %s", len(csv_paths), names)
+        return csv_paths  # next task picks these up off XCom
 
     @task(execution_timeout=timedelta(minutes=10), outlets=[CCW_DICTIONARY_ASSET])
     def land_ccw_dictionary() -> str:
@@ -330,24 +398,26 @@ def cms_outpatient_bronze_load() -> None:
 
         Downloads the CMS BlueButton ``all_meta.csv`` and replaces the dictionary
         table with it, every column text -- a plain bronze landing of a source
-        file. The claims load reads types and column descriptions back out of this
-        table in the same run, so the dictionary it applies is always the one just
-        landed (no drift). The table is a reusable, SQL-queryable asset for the
-        other claim files and for dbt.
+        file. The beneficiary load reads types and column descriptions back out of
+        this table in the same run, so the dictionary it applies is always the one
+        just landed (no drift). This is the same table the outpatient load writes;
+        both drop + rebuild it from the identical source file, so re-landing here
+        keeps this DAG runnable on its own without diverging from outpatient.
 
         Returns:
             The fully-qualified dictionary table name.
 
         Raises:
             ConnectionError: The metadata CSV could not be fetched.
+            ValueError: The metadata came back with no header row.
         """
         env = get_current_context()["params"]["env"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
         conn_id = f"portfolio_healthcare_{env}"
 
         # Held in memory and inserted via csv.DictReader rather than COPYed from a
         # file: the source has blank trailing lines COPY would reject, and writing
-        # a CSV next to the claims file would break that task's "exactly one CSV"
-        # check. all_meta.csv is small (a few hundred rows), so this is cheap.
+        # a CSV next to the beneficiary files would pollute that task's CSV glob.
+        # all_meta.csv is small (a few hundred rows), so this is cheap.
         log.info("fetching %s", DICTIONARY_URL)
         request = urllib.request.Request(DICTIONARY_URL, headers={"User-Agent": USER_AGENT})
         try:
@@ -382,108 +452,112 @@ def cms_outpatient_bronze_load() -> None:
         return DICTIONARY_TABLE
 
     @task(execution_timeout=timedelta(minutes=30))
-    def load_to_neon(csv_path: str) -> int:
-        """Replace the Neon bronze table with the CSV's contents, typed.
+    def load_to_neon(csv_paths: list[str]) -> int:
+        """Replace the Neon bronze table with the yearly CSVs' contents, typed.
 
-        The file COPYs *directly* into the typed table -- no intermediate all-text
+        Each file COPYs *directly* into the typed table -- no intermediate all-text
         staging copy -- using types read from the CCW dictionary table landed
-        upstream in this same run. Direct COPY halves peak Neon storage and works
-        because CMS dates carry a textual month Postgres parses natively and CSV
-        COPY reads an empty field as NULL. The cost is that a malformed value
-        aborts the COPY rather than surfacing in a cast -- fine for this trusted
-        source. Rows are preserved one-for-one -- only the column types change --
-        and each column is annotated with its CCW description as a Postgres
-        COMMENT. No types or descriptions are hard-coded in this repo.
+        upstream in this same run. Direct COPY halves peak Neon storage (the
+        staging table held the whole dataset a second time) and works because CMS
+        dates carry a textual month Postgres parses natively and CSV COPY reads an
+        empty field as NULL. The cost is that a malformed value aborts that file's
+        COPY rather than surfacing in a cast -- fine for this trusted source. Rows
+        are preserved one-for-one across all years; each *documented* column is
+        annotated with its CCW description as a COMMENT, and columns the codeset
+        doesn't cover land as text with no comment rather than failing the load.
 
-        In development the claims are filtered to the BENE_IDs already loaded into
-        ``BENEFICIARY_TABLE`` -- the dev patient cohort picked by the beneficiary
-        load (~1000 ids) -- so the dev claim subset stays joinable to the patients
-        and fits a small Neon database. That table must exist and be non-empty, so
-        run ``cms_beneficiary_bronze_load`` in development first. Production loads
-        every claim and does no filtering.
+        In development the load is capped to the first ``dev_beneficiary_limit``
+        distinct BENE_IDs (default 1000) so it fits a small Neon database. The kept
+        ids are the same across every year -- chosen once, then used to filter all
+        files. No separate cohort table is written: the resulting table *is* the
+        cohort, which the claim loads read back to subset themselves so their dev
+        rows still join. Production ignores the cap and loads every beneficiary.
 
         Each run drops and rebuilds the typed table, so it's idempotent: the table
-        always ends up equal to the (possibly subset) file, never with duplicate
-        rows. The steps are separate transactions; a mid-load failure leaves a
-        partial table the next run replaces wholesale -- still no duplicates, since
-        a run replaces, never appends.
+        always ends up equal to the (possibly subset) files, never with duplicate
+        rows. The per-file COPYs are separate transactions; a mid-load failure
+        leaves a partially filled table that the next run replaces wholesale --
+        still no duplicates, since a run replaces, never appends.
 
         The target environment comes from the run's `env` param (set on the
         trigger form), so the connection id is resolved here at runtime rather
         than baked in at parse time.
 
         Args:
-            csv_path: Absolute path to the extracted CSV, read off XCom. Assumed
-                reachable from this worker (see WORK_DIR note on task locality).
+            csv_paths: Absolute paths to the extracted CSVs, read off XCom.
+                Assumed reachable from this worker (see WORK_DIR note on task
+                locality).
 
         Returns:
-            Number of rows loaded.
+            Number of rows loaded across all files.
 
         Raises:
-            ValueError: The header has duplicate column names (which would make
-                the COPY target ambiguous), a shipped column is absent from the
-                CCW metadata (which would leave it un-typed/un-described), or (in
-                development) the beneficiary cohort is missing/empty or the file
-                has no BENE_ID column to filter on.
+            ValueError: A header has duplicate column names (which would make the
+                COPY target ambiguous), the files don't all share one header
+                (which would make a single union table wrong), or the dev cap is
+                requested but the beneficiary-id column is absent from the header.
         """
         env = get_current_context()["params"]["env"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
         conn_id = f"portfolio_healthcare_{env}"
         hook = PostgresHook(postgres_conn_id=conn_id)
 
-        header = _read_header(csv_path)
+        # One union table across years only makes sense if every file has the same
+        # columns in the same order. Assert it rather than trusting the release.
+        header = _read_header(csv_paths[0])
         if len(set(header)) != len(header):
             raise ValueError(f"duplicate column names in header: {header}")
+        for path in csv_paths[1:]:
+            other = _read_header(path)
+            if other != header:
+                raise ValueError(
+                    f"{os.path.basename(path)} header differs from {os.path.basename(csv_paths[0])}"
+                )
 
         # Types + descriptions come from the CCW dictionary table landed upstream
-        # in this same run (see land_ccw_dictionary) -- nothing about the schema is
-        # hard-coded, and the dictionary applied is always the one just landed, so
-        # the two can't drift. Every shipped column must resolve, so a silent
-        # layout change fails loudly rather than landing un-typed or un-commented.
+        # in this same run (see land_ccw_dictionary). Unlike outpatient, the MBSF
+        # layout is only partially documented there, so a column the codeset
+        # doesn't know lands as text with no comment -- it isn't an error.
         records = hook.get_records(  # pyright: ignore[reportUnknownMemberType]
             f"SELECT long_name, name, type, description FROM {DICTIONARY_TABLE};"
         )
         dictionary = _dictionary_from_records(records)
-        unknown = [col for col in header if col.upper() not in dictionary]
-        if unknown:
-            raise ValueError(f"columns missing from CCW metadata: {unknown}")
-        specs = {col: dictionary[col.upper()] for col in header}  # col -> (pg_type, description)
+        specs = {  # col -> (pg_type, description)
+            col: dictionary.get(col.upper(), (UNDOCUMENTED_TYPE, "")) for col in header
+        }
+        documented = [col for col in header if col.upper() in dictionary]
+        log.info(
+            "typing %s columns from CCW metadata; %s undocumented -> text",
+            len(documented),
+            len(header) - len(documented),
+        )
 
         idents = {col: _quote_ident(col) for col in header}
         col_list = ", ".join(idents[col] for col in header)
         typed_ddl = ",\n    ".join(f"{idents[col]} {specs[col][0]}" for col in header)
 
+        # Only documented columns get a COMMENT; an undocumented column has an
+        # empty description and is skipped so we don't stamp blank comments.
         comments = [
             f"COMMENT ON COLUMN {FQ_TABLE}.{idents[col]} IS {_quote_literal(specs[col][1])};"
             for col in header
+            if specs[col][1]
         ]
 
-        # Dev only: filter the claims to the beneficiary cohort already in Neon, so
-        # the dev claim subset matches the dev patients (rows join) and stays
-        # small. Production leaves `allowed` None and loads every claim whole.
-        allowed: set[str] | None = None
+        # Dev only: pick the cohort once. Production leaves `cohort` None and loads
+        # every file whole. The cap is read from the run param. No separate list
+        # table is kept -- the loaded cms_beneficiary table *is* the cohort, and
+        # the claim loads read their dev subset straight from it (see outpatient).
+        cohort: list[str] | None = None
         bene_idx = -1
         if env == "development":
+            limit = int(get_current_context()["params"]["dev_beneficiary_limit"])  # pyright: ignore[reportTypedDictNotRequiredAccess]
             if BENE_ID_COLUMN not in header:
                 raise ValueError(
-                    f"{BENE_ID_COLUMN} not in header; can't filter to the cohort: {header}"
+                    f"{BENE_ID_COLUMN} not in header; can't pick a dev cohort: {header}"
                 )
             bene_idx = header.index(BENE_ID_COLUMN)
-            if not hook.get_first(f"SELECT to_regclass('{BENEFICIARY_TABLE}');")[0]:  # pyright: ignore[reportUnknownMemberType]
-                raise ValueError(
-                    f"{BENEFICIARY_TABLE} not found -- run cms_beneficiary_bronze_load "
-                    "in development first so the claim subset matches the patient cohort."
-                )
-            bene_rows = hook.get_records(  # pyright: ignore[reportUnknownMemberType]
-                f'SELECT DISTINCT "{BENE_ID_COLUMN}" FROM {BENEFICIARY_TABLE} '
-                f'WHERE "{BENE_ID_COLUMN}" IS NOT NULL;'
-            )
-            allowed = {str(row[0]).strip() for row in bene_rows if row[0] is not None}
-            if not allowed:
-                raise ValueError(
-                    f"{BENEFICIARY_TABLE} has no beneficiaries -- run "
-                    "cms_beneficiary_bronze_load in development first."
-                )
-            log.info("dev subset: filtering claims to %s beneficiaries", len(allowed))
+            cohort = _collect_cohort(csv_paths, bene_idx, limit)
+            log.info("dev subset: keeping %s distinct %s", len(cohort), BENE_ID_COLUMN)
 
         # Rebuild the typed table. COPY lands rows straight here -- no staging copy.
         hook.run(  # pyright: ignore[reportUnknownMemberType]
@@ -494,21 +568,25 @@ def cms_outpatient_bronze_load() -> None:
             ]
         )
 
-        # COPY directly into the typed table; HEADER true skips the header. In dev
-        # the file is filtered to the cohort first (a tiny temp file in WORK_DIR,
-        # deleted once COPYed) so the full file never reaches Neon.
+        # COPY each yearly file directly into the typed table; HEADER true skips
+        # the header per file. In dev each file is filtered to the cohort first
+        # (a tiny temp file in WORK_DIR, deleted once COPYed) so the full file
+        # never reaches Neon.
         copy_sql = (
             f"COPY {FQ_TABLE} ({col_list}) FROM STDIN "
             f"WITH (FORMAT csv, HEADER true, DELIMITER '{DELIMITER}')"
         )
-        source = csv_path
-        if allowed is not None:
-            source = _filter_to_cohort(csv_path, bene_idx, allowed)
-        try:
-            hook.copy_expert(copy_sql, source)
-        finally:
-            if source != csv_path:
-                _safe_remove(source)
+        allowed = set(cohort) if cohort is not None else None
+        for path in csv_paths:
+            source = path
+            if allowed is not None:
+                source = _filter_to_cohort(path, bene_idx, allowed)
+            try:
+                hook.copy_expert(copy_sql, source)
+            finally:
+                if source != path:
+                    _safe_remove(source)
+            log.info("copied %s into %s", os.path.basename(path), FQ_TABLE)
 
         if comments:
             hook.run(comments)  # pyright: ignore[reportUnknownMemberType]
@@ -524,7 +602,7 @@ def cms_outpatient_bronze_load() -> None:
     dictionary_ready >> loaded  # pyright: ignore[reportUnusedExpression]
 
 
-bronze_load_dag = cms_outpatient_bronze_load()
+bronze_load_dag = cms_beneficiary_bronze_load()
 
 if __name__ == "__main__":
     bronze_load_dag.test()  # pyright: ignore[reportUnknownMemberType]
